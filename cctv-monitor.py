@@ -127,13 +127,22 @@ ROI_OVERLAP_RATIO   = 0.0
 
 KELAS_DIMONITOR    = None
 
-DEBUG_MODE          = True
+DEBUG_MODE          = False  # True = tulis detail deteksi per siklus (log jadi sangat besar)
 OFFLINE_THRESHOLD   = 60
 FRAME_SKIP          = 10
 
 CAMERA_FPS               = 25
 MISS_TOLERANCE_SECONDS   = 600
-MISS_TOLERANCE           = max(1, int(MISS_TOLERANCE_SECONDS * CAMERA_FPS / FRAME_SKIP))
+MISS_TOLERANCE           = max(1, int(MISS_TOLERANCE_SECONDS * CAMERA_FPS / FRAME_SKIP))  # (tidak dipakai lagi, diganti TTL berbasis waktu nyata)
+
+# ---- UPDATE TRACKER: masa hidup tracker berbasis WAKTU NYATA (bukan hitungan siklus) ----
+# Tracker yang sudah terkonfirmasi baru dianggap "barang keluar" kalau TIDAK terlihat
+# selama CONFIRMED_EXIT_SECONDS. Sebelumnya cuma ~4 menit (1500 siklus), padahal model
+# sering tidak mendeteksi barang sampai belasan menit -> barang dianggap keluar lalu
+# alert terkirim ulang saat terdeteksi lagi. Kandidat yang belum terkonfirmasi (noise)
+# tetap dibuang cepat lewat UNCONFIRMED_TTL_SECONDS.
+CONFIRMED_EXIT_SECONDS   = 1800   # 30 menit
+UNCONFIRMED_TTL_SECONDS  = 120    # 2 menit
 POSITION_TIMER_GRACE_PERIOD = 259200 # 3 hari
 
 GLOBAL_ALERT_COOLDOWN = 60
@@ -194,7 +203,7 @@ def setup_logging():
     file_handler.setFormatter(log_formatter)
 
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
 
@@ -580,8 +589,17 @@ def notif_barang_keluar(camera_name, class_name, tkey, entry_dt, exit_dt, durasi
 # kotak grid. Kalau tidak ada yang cukup dekat, baru dianggap posisi baru.
 _position_timer      = {}
 _position_timer_lock = threading.Lock()
-POSITION_SIZE_TOLERANCE = 0.5
-POSITION_MATCH_RADIUS   = 25  # px — toleransi jarak untuk dianggap "posisi yang sama"
+POSITION_SIZE_TOLERANCE = 0.65
+POSITION_MATCH_RADIUS   = 70  # px — dinaikkan dari 25. Bukti dari position_state_checkpoint (25 Sep):
+                                # 3 entry timer utk class "box" di posisi berdekatan (479,128) / (509,152) /
+                                # (442,116) — jarak antar titik 30-70px — TAPI masing-masing dianggap objek
+                                # BARU (bukan sambungan satu sama lain) karena radius lama (25px) terlalu
+                                # ketat utk jitter normal (goyang kamera, estimasi center-point YOLO antar
+                                # frame). Akibatnya timer "diam" tidak pernah nyambung lebih dari belasan
+                                # menit, jadi WAKTU_MAKSIMAL_DIAM (3 hari) tidak pernah tercapai walau
+                                # barangnya secara fisik tidak pindah. 70px dipilih supaya jitter wajar masih
+                                # tertampung tapi belum sampai menabrak box lain yang genuinely berbeda
+                                # (ROI cuma 226x261px, jadi 70px ~= 30% lebar ROI).
 
 def _find_nearby_key(store, cx, cy, class_name, radius):
     """Cari key (cx, cy, class_name) di 'store' yang class-nya sama dan
@@ -597,9 +615,43 @@ def _find_nearby_key(store, cx, cy, class_name, radius):
             best_key = key
     return best_key
 
+# ----------------------------------------------------------------------
+# PERBAIKAN TIMER RESET — pencocokan timer harus SADAR UKURAN
+# ----------------------------------------------------------------------
+# Bug lama: get_position_start() mencari record terdekat (radius 25px) tanpa
+# melihat ukuran, lalu MENGHAPUS record itu kalau ukuran box beda >50%.
+# Di tumpukan padat, dua barang yang bersebelahan (jarak <25px) dengan
+# ukuran berbeda (mis. 36x34 dan 15x14) memakai satu record yang sama, dan
+# tiap kali yang satu terdeteksi, dia menghapus timer yang lain -> timer
+# tidak pernah sempat mencapai 3 hari (WAKTU_MAKSIMAL_DIAM), jadi tidak ada
+# alert sama sekali walau barangnya diam berhari-hari.
+#
+# Sekarang: record dipilih berdasarkan JARAK *dan* KECOCOKAN UKURAN. Kalau
+# ukurannya tidak cocok, itu dianggap objek lain (dibuatkan record sendiri),
+# dan record milik objek lain TIDAK PERNAH dihapus karena beda ukuran.
+def _find_compatible_timer_key(cx, cy, class_name, bw, bh):
+    """Dipanggil sambil memegang _position_timer_lock."""
+    best_key, best_dist = None, float("inf")
+    for key, data in _position_timer.items():
+        kx, ky, kcls = key
+        if kcls != class_name:
+            continue
+        dist = ((cx - kx) ** 2 + (cy - ky) ** 2) ** 0.5
+        if dist >= POSITION_MATCH_RADIUS or dist >= best_dist:
+            continue
+        size = data.get("size")
+        if bw is not None and bh is not None and size and size[0] is not None:
+            pw, ph = size
+            if (abs(bw - pw) / max(pw, 1) > POSITION_SIZE_TOLERANCE or
+                    abs(bh - ph) / max(ph, 1) > POSITION_SIZE_TOLERANCE):
+                continue
+        best_dist = dist
+        best_key = key
+    return best_key
+
 def get_position_start(cx, cy, class_name, bw=None, bh=None):
     with _position_timer_lock:
-        key = _find_nearby_key(_position_timer, cx, cy, class_name, POSITION_MATCH_RADIUS)
+        key = _find_compatible_timer_key(cx, cy, class_name, bw, bh)
         if key is None:
             return None
         data = _position_timer[key]
@@ -607,27 +659,21 @@ def get_position_start(cx, cy, class_name, bw=None, bh=None):
         if gap > POSITION_TIMER_GRACE_PERIOD:
             del _position_timer[key]
             return None
-
-        if bw is not None and bh is not None and "size" in data:
-            pw, ph = data["size"]
-            size_diff_w = abs(bw - pw) / max(pw, 1)
-            size_diff_h = abs(bh - ph) / max(ph, 1)
-            if size_diff_w > POSITION_SIZE_TOLERANCE or size_diff_h > POSITION_SIZE_TOLERANCE:
-                del _position_timer[key]
-                return None
-
         return data["start"]
 
 def set_position_start(cx, cy, class_name, t=None, bw=None, bh=None):
     now = t if t is not None else time.time()
     with _position_timer_lock:
-        key = _find_nearby_key(_position_timer, cx, cy, class_name, POSITION_MATCH_RADIUS)
+        key = _find_compatible_timer_key(cx, cy, class_name, bw, bh)
         if key is None:
-            _position_timer[(cx, cy, class_name)] = {"start": now, "last_seen": now, "size": (bw, bh)}
+            new_key = (cx, cy, class_name)
+            while new_key in _position_timer:   # hindari menimpa record objek lain di titik yang persis sama
+                new_key = (new_key[0] + 1, new_key[1], class_name)
+            _position_timer[new_key] = {"start": now, "last_seen": now, "size": (bw, bh)}
 
 def touch_position_start(cx, cy, class_name, bw=None, bh=None):
     with _position_timer_lock:
-        key = _find_nearby_key(_position_timer, cx, cy, class_name, POSITION_MATCH_RADIUS)
+        key = _find_compatible_timer_key(cx, cy, class_name, bw, bh)
         if key is not None:
             _position_timer[key]["last_seen"] = time.time()
             if bw is not None and bh is not None:
@@ -664,73 +710,212 @@ def touch_position_start(cx, cy, class_name, bw=None, bh=None):
 # ke file JSON di disk setiap kali berubah, dan di-load kembali begitu
 # script (proses baru) mulai. Jadi identitas barang tidak hilang lagi
 # walau prosesnya sempat mati/di-restart, ROI/kamera tidak berubah.
-POSITION_STATE_FILE = os.getenv("POSITION_STATE_FILE", "position_state.json")
+# ----------------------------------------------------------------------
+# PERBAIKAN #3 — checkpoint SEBELUMNYA pakai path RELATIF ("position_state.json"),
+# jadi kalau proses ini dijalankan ulang dari working directory yang berbeda
+# (umum terjadi kalau start-nya lewat systemd/docker/cron tanpa WorkingDirectory
+# yang konsisten), file checkpoint lama tidak pernah ketemu lagi -> _load_
+# position_state() selalu mulai dari kosong, padahal file lama (di folder lain)
+# sebenarnya ada. Terbukti dari log: dalam >750rb baris log / >30 jam berjalan,
+# baris "[POSITION STATE] Checkpoint dimuat" TIDAK PERNAH sekalipun muncul.
+#
+# Sekarang: (1) path file dibuat ABSOLUT, nempel ke folder script ini sendiri,
+# jadi tidak tergantung dari mana proses dijalankan; (2) checkpoint JUGA
+# disimpan ke database (tabel POSITION_STATE_DB_TABLE) lewat connection pool
+# yang sudah ada -> jauh lebih tahan banting daripada file lokal (survive
+# walau seluruh disk/container di-reset), file lokal jadi lapisan cadangan
+# kedua kalau DB kebetulan lagi tidak bisa diakses saat startup; (3) checkpoint
+# disimpan tiap POSITION_STATE_SAVE_INTERVAL detik lewat thread khusus (lihat
+# position_state_saver_worker), bukan cuma tiap 1 jam (CLEANUP_INTERVAL) ->
+# kalau proses restart mendadak, progres yang hilang maksimal cuma beberapa
+# puluh detik, bukan berjam-jam.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+POSITION_STATE_FILE = os.getenv(
+    "POSITION_STATE_FILE",
+    os.path.join(_SCRIPT_DIR, "position_state.json")
+)
+POSITION_STATE_DB_TABLE     = "position_state_checkpoint"
+POSITION_STATE_SAVE_INTERVAL = 60  # detik
+
+def _ensure_position_state_table():
+    """Buat tabel checkpoint di DB kalau belum ada (idempotent, aman dipanggil
+    berkali-kali). Dipanggil sekali saat modul di-import, sebelum load pertama."""
+    conn = get_db_connection()
+    if not conn:
+        log.warning("[POSITION STATE] Tidak bisa konek DB untuk siapkan tabel checkpoint "
+                     "(akan coba lagi tiap kali save/load) — sementara pakai file lokal saja")
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {POSITION_STATE_DB_TABLE} (
+                cx INTEGER NOT NULL,
+                cy INTEGER NOT NULL,
+                class_name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('timer', 'db_id')),
+                start_ts DOUBLE PRECISION,
+                db_id INTEGER,
+                size_w INTEGER,
+                size_h INTEGER,
+                last_seen DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (cx, cy, class_name, kind)
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        log.warning(f"[POSITION STATE] Gagal menyiapkan tabel checkpoint di DB: {e}")
+    finally:
+        release_db_connection(conn)
 
 def _save_position_state():
-    """Tulis snapshot _position_timer + _position_db_id ke disk (atomic write).
-    Dipanggil tiap kali db_id berubah (assign/clear) dan berkala dari
-    cleanup_old_entries(), supaya kalau proses mati mendadak, checkpoint
-    yang hilang paling banyak cuma perubahan sejak penyimpanan terakhir."""
+    """Tulis snapshot _position_timer + _position_db_id ke DB (utama, tahan
+    restart/reset container) DAN ke file lokal (cadangan). Dipanggil tiap kali
+    db_id berubah (assign/clear), berkala dari cleanup_old_entries(), dan tiap
+    POSITION_STATE_SAVE_INTERVAL detik dari position_state_saver_worker()."""
+    with _position_timer_lock, _position_db_id_lock:
+        timer_records = [
+            {"cx": k[0], "cy": k[1], "class": k[2],
+             "start": v["start"], "last_seen": v["last_seen"], "size": v.get("size")}
+            for k, v in _position_timer.items()
+        ]
+        db_id_records = [
+            {"cx": k[0], "cy": k[1], "class": k[2],
+             "db_id": v["db_id"], "last_seen": v["last_seen"]}
+            for k, v in _position_db_id.items()
+        ]
+
+    # ---- 1) simpan ke DB (paling tahan banting) ----
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute(f"DELETE FROM {POSITION_STATE_DB_TABLE} WHERE kind = 'timer'")
+            for rec in timer_records:
+                size = rec.get("size") or (None, None)
+                cur.execute(f"""
+                    INSERT INTO {POSITION_STATE_DB_TABLE}
+                        (cx, cy, class_name, kind, start_ts, size_w, size_h, last_seen)
+                    VALUES (%s, %s, %s, 'timer', %s, %s, %s, %s)
+                """, (rec["cx"], rec["cy"], rec["class"], rec["start"],
+                      size[0], size[1], rec["last_seen"]))
+            cur.execute(f"DELETE FROM {POSITION_STATE_DB_TABLE} WHERE kind = 'db_id'")
+            for rec in db_id_records:
+                cur.execute(f"""
+                    INSERT INTO {POSITION_STATE_DB_TABLE}
+                        (cx, cy, class_name, kind, db_id, last_seen)
+                    VALUES (%s, %s, %s, 'db_id', %s, %s)
+                """, (rec["cx"], rec["cy"], rec["class"], rec["db_id"], rec["last_seen"]))
+            conn.commit()
+        except Exception as e:
+            log.warning(f"[POSITION STATE] Gagal menyimpan checkpoint ke DB: {e}")
+        finally:
+            release_db_connection(conn)
+    else:
+        log.warning("[POSITION STATE] DB tidak tersedia, checkpoint kali ini cuma tersimpan di file lokal")
+
+    # ---- 2) simpan ke file lokal juga (cadangan kalau DB down saat startup) ----
     try:
-        with _position_timer_lock, _position_db_id_lock:
-            timer_records = [
-                {"cx": k[0], "cy": k[1], "class": k[2],
-                 "start": v["start"], "last_seen": v["last_seen"], "size": v.get("size")}
-                for k, v in _position_timer.items()
-            ]
-            db_id_records = [
-                {"cx": k[0], "cy": k[1], "class": k[2],
-                 "db_id": v["db_id"], "last_seen": v["last_seen"]}
-                for k, v in _position_db_id.items()
-            ]
         payload = {"position_timer": timer_records, "position_db_id": db_id_records}
         tmp_path = POSITION_STATE_FILE + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         os.replace(tmp_path, POSITION_STATE_FILE)  # replace atomik, tidak akan corrupt kalau mati di tengah
     except Exception as e:
-        log.warning(f"[POSITION STATE] Gagal menyimpan checkpoint: {e}")
+        log.warning(f"[POSITION STATE] Gagal menyimpan checkpoint ke file lokal ({POSITION_STATE_FILE}): {e}")
 
 def _load_position_state():
-    """Muat kembali _position_timer + _position_db_id dari checkpoint disk
-    (kalau ada) SEBELUM main() mulai. Ini yang bikin identitas barang tahan
-    restart proses. Entry yang sudah lewat POSITION_TIMER_GRACE_PERIOD (3
-    hari) langsung dibuang saat load supaya tidak menghidupkan lagi barang
-    yang memang sudah lama tidak keliatan."""
-    if not os.path.exists(POSITION_STATE_FILE):
-        return
-    try:
-        with open(POSITION_STATE_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        now = time.time()
-        loaded_timer = 0
-        loaded_db_id = 0
-        with _position_timer_lock:
-            for rec in payload.get("position_timer", []):
-                if now - rec["last_seen"] > POSITION_TIMER_GRACE_PERIOD:
-                    continue
-                key = (rec["cx"], rec["cy"], rec["class"])
-                size = tuple(rec["size"]) if rec.get("size") else None
-                _position_timer[key] = {"start": rec["start"], "last_seen": rec["last_seen"], "size": size}
-                loaded_timer += 1
-        with _position_db_id_lock:
-            for rec in payload.get("position_db_id", []):
-                if now - rec["last_seen"] > POSITION_TIMER_GRACE_PERIOD:
-                    continue
-                key = (rec["cx"], rec["cy"], rec["class"])
-                _position_db_id[key] = {"db_id": rec["db_id"], "last_seen": rec["last_seen"]}
-                loaded_db_id += 1
-        log.info(f"[POSITION STATE] Checkpoint dimuat dari {POSITION_STATE_FILE}: "
-                 f"{loaded_timer} timer posisi, {loaded_db_id} mapping db_id "
-                 f"(mencegah barang lama dianggap baru setelah restart)")
-    except Exception as e:
-        log.warning(f"[POSITION STATE] Gagal memuat checkpoint ({e}), mulai dari kosong")
+    """Muat kembali _position_timer + _position_db_id SEBELUM main() mulai,
+    supaya identitas & timer barang tahan restart proses. Coba DB dulu (paling
+    tahan banting); kalau DB tidak bisa diakses/kosong, fallback ke file lokal.
+    Entry yang sudah lewat POSITION_TIMER_GRACE_PERIOD (3 hari) langsung
+    dibuang saat load supaya tidak menghidupkan lagi barang yang memang sudah
+    lama tidak keliatan."""
+    now = time.time()
+    loaded_timer = 0
+    loaded_db_id = 0
+    source = None
+
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT cx, cy, class_name, start_ts, size_w, size_h, last_seen "
+                        f"FROM {POSITION_STATE_DB_TABLE} WHERE kind = 'timer'")
+            rows = cur.fetchall()
+            with _position_timer_lock:
+                for cx, cy, cls, start_ts, sw, sh, last_seen in rows:
+                    if now - last_seen > POSITION_TIMER_GRACE_PERIOD:
+                        continue
+                    size = (sw, sh) if sw is not None and sh is not None else None
+                    _position_timer[(cx, cy, cls)] = {"start": start_ts, "last_seen": last_seen, "size": size}
+                    loaded_timer += 1
+            cur.execute(f"SELECT cx, cy, class_name, db_id, last_seen "
+                        f"FROM {POSITION_STATE_DB_TABLE} WHERE kind = 'db_id'")
+            rows = cur.fetchall()
+            with _position_db_id_lock:
+                for cx, cy, cls, db_id, last_seen in rows:
+                    if now - last_seen > POSITION_TIMER_GRACE_PERIOD:
+                        continue
+                    _position_db_id[(cx, cy, cls)] = {"db_id": db_id, "last_seen": last_seen}
+                    loaded_db_id += 1
+            source = f"database (tabel {POSITION_STATE_DB_TABLE})"
+        except Exception as e:
+            log.warning(f"[POSITION STATE] Gagal memuat checkpoint dari DB ({e}), coba file lokal...")
+        finally:
+            release_db_connection(conn)
+    else:
+        log.warning("[POSITION STATE] DB tidak tersedia saat startup, coba file lokal...")
+
+    # Fallback ke file lokal HANYA kalau DB tidak menghasilkan apa-apa (down/kosong/error)
+    if source is None:
+        if not os.path.exists(POSITION_STATE_FILE):
+            log.warning(f"[POSITION STATE] Tidak ada checkpoint di DB maupun di file lokal "
+                        f"({POSITION_STATE_FILE}) — mulai dari KOSONG. Kalau ini bukan run "
+                        f"pertama, berarti timer barang yang sedang berjalan RESET KE NOL.")
+            return
+        try:
+            with open(POSITION_STATE_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            with _position_timer_lock:
+                for rec in payload.get("position_timer", []):
+                    if now - rec["last_seen"] > POSITION_TIMER_GRACE_PERIOD:
+                        continue
+                    key = (rec["cx"], rec["cy"], rec["class"])
+                    size = tuple(rec["size"]) if rec.get("size") else None
+                    _position_timer[key] = {"start": rec["start"], "last_seen": rec["last_seen"], "size": size}
+                    loaded_timer += 1
+            with _position_db_id_lock:
+                for rec in payload.get("position_db_id", []):
+                    if now - rec["last_seen"] > POSITION_TIMER_GRACE_PERIOD:
+                        continue
+                    key = (rec["cx"], rec["cy"], rec["class"])
+                    _position_db_id[key] = {"db_id": rec["db_id"], "last_seen": rec["last_seen"]}
+                    loaded_db_id += 1
+            source = f"file lokal ({POSITION_STATE_FILE})"
+        except Exception as e:
+            log.warning(f"[POSITION STATE] Gagal memuat checkpoint dari file lokal juga ({e}), mulai dari kosong")
+            return
+
+    log.info(f"[POSITION STATE] Checkpoint dimuat dari {source}: "
+             f"{loaded_timer} timer posisi, {loaded_db_id} mapping db_id "
+             f"(mencegah timer & identitas barang lama dianggap baru setelah restart)")
+
+def position_state_saver_worker():
+    """Simpan checkpoint tiap POSITION_STATE_SAVE_INTERVAL detik, independen dari
+    cleanup_old_entries() yang cuma jalan tiap 1 jam. Ini yang bikin jendela
+    kehilangan progres kalau proses restart mendadak jadi hitungan detik, bukan
+    jam."""
+    while True:
+        time.sleep(POSITION_STATE_SAVE_INTERVAL)
+        _save_position_state()
 
 _position_db_id      = {}
 _position_db_id_lock = threading.Lock()
 
-# Muat checkpoint SEKARANG (saat modul di-import / proses baru mulai),
-# sebelum main() pertama kali jalan.
+# Siapkan tabel checkpoint di DB (kalau belum ada), lalu muat checkpoint
+# SEKARANG (saat modul di-import / proses baru mulai), sebelum main() pertama
+# kali jalan.
+_ensure_position_state_table()
 _load_position_state()
 
 def get_position_db_id(cx, cy, class_name):
@@ -1279,12 +1464,15 @@ def main():
     log.info("=" * 60)
     log.info(f"[START] {CAMERA_NAME} — {datetime.datetime.now()}")
     log.info(f"[CONFIG] IMG_SIZE={IMG_SIZE} | CONF_THRESHOLD={CONF_THRESHOLD}")
+    log.info(f"[CONFIG] Checkpoint posisi: DB tabel '{POSITION_STATE_DB_TABLE}' "
+             f"+ file lokal '{POSITION_STATE_FILE}' (disimpan tiap {POSITION_STATE_SAVE_INTERVAL}s)")
     log.info("=" * 60)
 
-    threading.Thread(target=_alert_worker,        daemon=True).start()
-    threading.Thread(target=check_kamera_offline, daemon=True).start()
-    threading.Thread(target=cleanup_old_entries,  daemon=True).start()
-    threading.Thread(target=heartbeat_worker,     daemon=True).start()
+    threading.Thread(target=_alert_worker,              daemon=True).start()
+    threading.Thread(target=check_kamera_offline,       daemon=True).start()
+    threading.Thread(target=cleanup_old_entries,        daemon=True).start()
+    threading.Thread(target=heartbeat_worker,           daemon=True).start()
+    threading.Thread(target=position_state_saver_worker, daemon=True).start()
     start_monitor_alert()
 
     log.info("[INFO] Memuat model YOLO...")
@@ -1327,10 +1515,25 @@ def main():
         except Exception as e:
             # PENTING: kalau person model gagal total dimuat, JANGAN sampai ini
             # menjatuhkan main() (lihat catatan lama di sekitar predict() di bawah
-            # soal kenapa itu berbahaya untuk state tracker). Cukup nonaktifkan
-            # filter untuk sesi ini.
-            log.error(f"[PERSON FILTER] Gagal memuat model: {e}")
-            person_model = None
+            # soal kenapa itu berbahaya untuk state tracker).
+            #
+            # Sebelumnya di sini langsung person_model=None (filter mati total).
+            # Tapi kalau PERSON_MODEL_PATH ADA sebagai folder namun isinya bukan
+            # format OpenVINO yang valid (mis. export belum lengkap/salah folder),
+            # os.path.exists() di atas tetap True sehingga cabang fallback normal
+            # tidak pernah kena, dan filter person mati diam-diam. Sekarang coba
+            # fallback ke yolov8n.pt dulu (sama seperti kalau foldernya memang
+            # tidak ada) sebelum benar-benar menyerah.
+            log.error(f"[PERSON FILTER] Gagal memuat model custom di '{PERSON_MODEL_PATH}': {e}")
+            try:
+                log.warning("[PERSON FILTER] Fallback ke model pretrained yolov8n.pt")
+                person_model = YOLO("yolov8n.pt")
+                if person_model.names.get(0) != "person":
+                    log.warning("[PERSON FILTER] Class 0 bukan 'person' di fallback juga. Filter dinonaktifkan.")
+                    person_model = None
+            except Exception as e2:
+                log.error(f"[PERSON FILTER] Fallback yolov8n.pt juga gagal: {e2}. Filter dinonaktifkan.")
+                person_model = None
 
     grabber = FrameGrabber(CCTV_SOURCE).start()
     pos_trackers     = {}
@@ -1380,7 +1583,7 @@ def main():
             augment=False,
             verbose=False,
         )
-        log.info(f"[TIMING] model.track selesai dalam {time.time()-t0:.2f}s | roi_frame shape={roi_frame.shape}")
+        log.debug(f"[TIMING] model.track selesai dalam {time.time()-t0:.2f}s | roi_frame shape={roi_frame.shape}")
 
         all_detections = []
         if results[0].boxes is not None and len(results[0].boxes) > 0:
@@ -1389,16 +1592,16 @@ def main():
             conf_m  = results[0].boxes.conf.cpu().numpy()
             ids_m   = results[0].boxes.id.int().cpu().numpy() if results[0].boxes.id is not None else [None] * len(boxes_m)
 
-            log.info(f"[DETEKSI MENTAH] Jumlah: {len(boxes_m)}")
+            log.debug(f"[DETEKSI MENTAH] Jumlah: {len(boxes_m)}")
             for box, cls, conf, oid in zip(boxes_m, cls_m, conf_m, ids_m):
                 bx1, by1, bx2, by2 = map(int, box)
                 bx1 += crop_x1; bx2 += crop_x1
                 by1 += crop_y1; by2 += crop_y1
                 class_name = model.names[cls]
-                log.info(f"  - {class_name} conf={conf:.2f} box=({bx1},{by1},{bx2},{by2}) oid={oid}")
+                log.debug(f"  - {class_name} conf={conf:.2f} box=({bx1},{by1},{bx2},{by2}) oid={oid}")
                 all_detections.append((bx1, by1, bx2, by2, class_name, float(conf), "main", oid))
         else:
-            log.info("[DETEKSI MENTAH] Tidak ada deteksi")
+            log.debug("[DETEKSI MENTAH] Tidak ada deteksi")
         del results
 
         # ---- FILTER PERSON: buang deteksi "box" yang sebenarnya kepala/badan orang ----
@@ -1492,11 +1695,13 @@ def main():
                     "db_id": None,
                     "escalation_count": 0,
                     "confirm_class": class_name,
+                    "last_seen_ts": current_time,
                 }
                 log.info(f"[Tracker Kandidat] #{tkey} di ({cx},{cy}) hit 1/{CONFIRMATION_HITS_REQUIRED}, belum dikonfirmasi")
 
             tracker = pos_trackers[tkey]
             tracker["miss_count"] = 0
+            tracker["last_seen_ts"] = current_time
             tracker["class"] = class_name
             tracker["last_oid"] = oid
             tracker["pos"] = (cx, cy)
@@ -1531,6 +1736,18 @@ def main():
 
                 tracker["start"] = start_time
                 tracker["confirmed"] = True
+
+                # Warisi db_id & status alert kalau posisi fisik ini SUDAH pernah dialert
+                # (mis. proses restart) -> alert yang sama tidak terkirim ulang.
+                _existing_db = get_position_db_id(cx, cy, class_name)
+                if _existing_db is not None:
+                    tracker["db_id"] = _existing_db
+                    _lewat = [t for t in ESCALATION_THRESHOLDS if t <= (current_time - start_time)]
+                    if _lewat:
+                        tracker["last_alert_durasi"] = max(_lewat)
+                        tracker["escalation_count"] = len(_lewat)
+                    log.info(f"[Tracker Diwarisi] #{tkey} memakai db_id={_existing_db}, "
+                             f"alert terakhir ambang {tracker['last_alert_durasi']}s (tidak kirim ulang)")
                 record_confirmed_box_size(bw, bh)
                 log.info(f"[Tracker Terkonfirmasi] #{tkey} total tracker aktif: {len(pos_trackers)}")
                 # CATATAN: TIDAK insert ke DB di sini. Baris DB baru dibuat nanti
@@ -1580,12 +1797,12 @@ def main():
 
                     _cx, _cy, _cn = cx, cy, class_name
 
-                    def make_callback(acx, acy, acn):
+                    def make_callback(acx, acy, acn, atracker):
                         def cb(success):
                             if not success:
                                 set_last_alert_time(acx, acy, acn, 0)
-                                tracker["last_alert_durasi"] = 0
-                                tracker["last_alert_time"] = 0
+                                atracker["last_alert_durasi"] = 0
+                                atracker["last_alert_time"] = 0
                         return cb
 
                     # ---- baris DB baru dibuat DI SINI (baru capai ambang alert),
@@ -1629,20 +1846,32 @@ def main():
                                   f"setelah {DB_WRITE_RETRY}x percobaan")
 
                     log.info(f"[ALERT] Mengirim duration={int(durasi)}s ke n8n (db_id={tracker['db_id']})")
-                    queue_alert(N8N_WEBHOOK_URL, tkey, tracker["db_id"], class_name,
-                                durasi, alert_frame,
-                                make_callback(_cx, _cy, _cn))
+                    queue_alert(N8N_WEBHOOK_URL, tkey,
+                                tracker["db_id"] if tracker["db_id"] is not None else tkey,
+                                class_name, durasi, alert_frame,
+                                make_callback(_cx, _cy, _cn, tracker))
 
         # Cleanup tracker
         for old_key in list(pos_trackers.keys()):
             if old_key not in active_keys:
                 pos_trackers[old_key]["miss_count"] += 1
-                if pos_trackers[old_key]["miss_count"] > MISS_TOLERANCE:
-                    old_data = pos_trackers[old_key]
-                    log.warning(f"[TRACKER HAPUS] #{old_key} class={old_data['class']} hilang > {MISS_TOLERANCE_SECONDS}s")
+                _old = pos_trackers[old_key]
+                _ttl = CONFIRMED_EXIT_SECONDS if _old.get("confirmed") else UNCONFIRMED_TTL_SECONDS
+                if current_time - _old.get("last_seen_ts", current_time) > _ttl:
+                    old_data = _old
+                    log.warning(f"[TRACKER HAPUS] #{old_key} class={old_data['class']} hilang > {int(_ttl)}s")
 
                     # ---- catat waktu barang keluar (tanggal & jam nyata) ----
-                    if old_data.get("confirmed") and old_data.get("db_id") is not None:
+                    _ox, _oy = old_data["pos"]
+                    _ada_pengganti = any(
+                        k2 != old_key and d2.get("confirmed") and d2["class"] == old_data["class"]
+                        and ((d2["pos"][0] - _ox) ** 2 + (d2["pos"][1] - _oy) ** 2) ** 0.5 < POSITION_MATCH_RADIUS
+                        for k2, d2 in pos_trackers.items()
+                    )
+                    if _ada_pengganti:
+                        log.info(f"[TRACKER HAPUS] #{old_key} tidak ditandai KELUAR: masih ada tracker lain "
+                                 f"di posisi yang sama (barang yang sama)")
+                    elif old_data.get("confirmed") and old_data.get("db_id") is not None:
                         exit_dt     = datetime.datetime.now()
                         durasi_diam = current_time - old_data["start"]
                         entry_dt    = datetime.datetime.fromtimestamp(old_data["start"])
